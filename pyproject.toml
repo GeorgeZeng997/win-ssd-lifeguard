@@ -1,0 +1,49 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "win-ssd-lifeguard"
+version = "1.0.0"
+description = "Deep ATA/ACS-3 SSD Forensics, Fake SMART Detector, Real-Time Write Hunter, and 7-Layer Lifespan Extension Suite (Dynamic RAMDisk, Cache Junction Offloader & Hardware Over-Provisioning)"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.9"
+authors = [
+    { name = "GeorgeZeng997" }
+]
+keywords = [
+    "ssd",
+    "smart",
+    "forensics",
+    "ata-pass-through",
+    "ramdisk",
+    "over-provisioning",
+    "wear-leveling",
+    "windows",
+    "dram-less",
+    "trim"
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: Win32 (MS Windows)",
+    "Environment :: X11 Applications",
+    "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Topic :: System :: Hardware",
+    "Topic :: System :: Monitoring",
+    "Topic :: Utilities",
+]
+dependencies = []
+
+[project.scripts]
+win-ssd-lifeguard = "ssd_lifeguard.cli:main"
+win-ssd-lifeguard-gui = "ssd_lifeguard.gui:launch_gui"
+
+[tool.hatch.build.targets.wheel]
+packages = ["ssd_lifeguard"]
