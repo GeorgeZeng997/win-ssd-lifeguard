@@ -52,15 +52,15 @@ class WriteHuntResult:
 
 
 def classify_file_path(path_str: str) -> str:
-    low = path_str.lower()
+    low = path_str.lower().replace("/", "\\")
+    if any(k in low for k in ("\\pip\\", "npm-cache", "uv\\cache", "node-compile-cache", "cargo\\registry", "nuget\\packages")):
+        return "Developer Package / Compile Cache"
     if any(k in low for k in ("cache", "code cache", "gpucache", "shadercache", "d3dscache", "dxcache", "glcache")):
         return "Browser / GPU Shader Cache"
     if any(k in low for k in ("indexeddb", "leveldb", "local storage", "webstorage", "cookies")):
         return "Browser IndexedDB / Storage"
     if any(k in low for k in ("nvtopps", "larkshell", "kccsdkbak", "telemetry", ".log", ".evtx", "crashdumps")):
         return "Background Telemetry / Log"
-    if any(k in low for k in ("pip", "npm-cache", "uv\\cache", "node-compile-cache")):
-        return "Developer Package / Compile Cache"
     if "\\temp\\" in low or low.endswith(".tmp"):
         return "Temporary File"
     return "Application / User Data"

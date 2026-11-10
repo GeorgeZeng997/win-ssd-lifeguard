@@ -8,18 +8,17 @@ Uses raw Windows Win32 `IOCTL_ATA_PASS_THROUGH` (`0x0004D02C`) to query:
   2. ATA `SMART READ DATA (0xB0 / 0xD0)` (Legacy 512-byte SMART table)
   3. ACS-3 `READ LOG EXT (0x2F)` GP Log `0x04` (Device Statistics: Page 0x01 General,
      Page 0x04 Transport Hardware Resets, Page 0x05 Temperature, Page 0x07 Real Endurance Used)
-  4. ATA `SMART READ LOG (0xB0 / 0xD5)` Log `0xE0` (Yeestor YS9082HP / SiliconGo Vendor
+  4. ATA `SMART READ LOG (0xB0 / 0xD5)` Log `0xE0` / `0xA0` (Yeestor YS9082HP / SiliconGo Vendor
      FTL & NAND Flash health page: Flash ID, Max/Min/Avg Erase Counts, Bad Blocks)
 """
 
 from __future__ import annotations
 
 import ctypes
-import os
 import platform
 import struct
-from dataclasses import dataclass, field, asdict
-from typing import Dict, List, Optional, Tuple
+from dataclasses import asdict, dataclass, field
+from typing import Any, Dict, List, Optional, Tuple
 
 IOCTL_ATA_PASS_THROUGH = 0x0004D02C
 ATA_FLAGS_DRDY_REQUIRED = 0x01
@@ -76,6 +75,15 @@ NAND_VENDOR_MAP: Dict[int, str] = {
     0xAD: "SK Hynix",
     0x9B: "YMTC (Yangtze Memory)",
 }
+
+
+def _to_signed_int8(byte_val: int) -> int:
+    v = byte_val & 0xFF
+    return v - 256 if v >= 128 else v
+
+
+def _is_valid_handle(handle: Any) -> bool:
+    return handle is not None and handle not in (0, -1, 0xFFFFFFFF, 0xFFFFFFFFFFFFFFFF)
 
 
 @dataclass
@@ -141,6 +149,16 @@ class VendorNandStats:
 
 
 @dataclass
+class LifespanEstimate:
+    composite_health_score: int = 100
+    health_grade: str = "EXCELLENT"
+    daily_host_writes_gib: float = 0.0
+    effective_wear_factor: float = 1.0
+    estimated_remaining_days: Optional[int] = None
+    estimated_remaining_years: Optional[float] = None
+
+
+@dataclass
 class ForensicAnomaly:
     severity: str  # "CRITICAL", "WARNING", "INFO"
     code: str
@@ -159,20 +177,29 @@ class DriveForensicReport:
     smart_attributes: List[SmartAttribute] = field(default_factory=list)
     gp_log04: GpLog04Stats = field(default_factory=GpLog04Stats)
     vendor_nand: VendorNandStats = field(default_factory=VendorNandStats)
+    lifespan: LifespanEstimate = field(default_factory=LifespanEstimate)
     anomalies: List[ForensicAnomaly] = field(default_factory=list)
     is_fake_smart: bool = False
     true_health_pct: int = 100
     reported_health_pct: int = 100
 
-    def to_dict(self) -> dict:
-        return asdict(self)
+    def to_dict(self) -> Dict[str, Any]:
+        d = asdict(self)
+        d["gp_log04"]["host_writes_gib"] = self.gp_log04.host_writes_gib
+        d["gp_log04"]["host_reads_gib"] = self.gp_log04.host_reads_gib
+        d["gp_log04"]["avg_write_size_kb"] = self.gp_log04.avg_write_size_kb
+        d["vendor_nand"]["erase_skew_ratio"] = self.vendor_nand.erase_skew_ratio
+        return d
 
 
 def _swap_ata_string(raw: bytes) -> str:
-    chars = bytearray(len(raw))
-    for i in range(0, len(raw) - 1, 2):
+    even_len = len(raw) & ~1
+    chars = bytearray(even_len)
+    for i in range(0, even_len, 2):
         chars[i] = raw[i + 1]
         chars[i + 1] = raw[i]
+    if len(raw) % 2 == 1:
+        chars.append(raw[-1])
     return chars.decode("ascii", errors="replace").strip()
 
 
@@ -191,17 +218,6 @@ def _ata_pass_through(
 
     header_size = 48
     buf = ctypes.create_string_buffer(header_size + data_len)
-    # 64-bit Windows ATA_PASS_THROUGH_EX layout (48 bytes):
-    # 0x00: USHORT Length (48)
-    # 0x02: USHORT AtaFlags
-    # 0x04: UCHAR PathId, TargetId, Lun, ReservedAsUchar (4 bytes)
-    # 0x08: ULONG DataTransferLength
-    # 0x0C: ULONG TimeOutValue
-    # 0x10: ULONG ReservedAsUlong
-    # 0x14: ULONG Padding (x64 alignment)
-    # 0x18: ULONG_PTR DataBufferOffset (8 bytes on x64 = 48)
-    # 0x20: UCHAR PreviousTaskFile[8]
-    # 0x28: UCHAR CurrentTaskFile[8]
     struct.pack_into(
         "<HH4BIIIIQ8s8s",
         buf,
@@ -241,6 +257,8 @@ def _ata_pass_through(
 
 
 def _decode_nand_id(flash_bytes: bytes) -> Tuple[str, str, str]:
+    if not flash_bytes:
+        return "", "Unknown", "Unknown NAND"
     hex_str = " ".join(f"{b:02X}" for b in flash_bytes)
     vendor_id = flash_bytes[0]
     vendor = NAND_VENDOR_MAP.get(vendor_id, f"Vendor 0x{vendor_id:02X}")
@@ -252,6 +270,75 @@ def _decode_nand_id(flash_bytes: bytes) -> Tuple[str, str, str]:
     elif vendor_id == 0x9B:
         desc = "YMTC Xtacking 3D TLC NAND"
     return hex_str, vendor, desc
+
+
+def compute_lifespan_metrics(
+    report: DriveForensicReport, smart_map: Optional[Dict[int, SmartAttribute]] = None
+) -> LifespanEstimate:
+    """Compute a composite SSD reliability score (0..100), effective wear factor, and Remaining Useful Life."""
+    smart_map = smart_map or {a.attr_id: a for a in report.smart_attributes}
+    score = int(max(0, min(100, report.true_health_pct)))
+
+    # Penalize static-block erase skew on DRAM-less controllers
+    if report.vendor_nand.detected and report.vendor_nand.erase_skew_ratio >= 2.0:
+        skew_pen = min(20, int((report.vendor_nand.erase_skew_ratio - 1.5) * 3.0))
+        score -= skew_pen
+
+    # Penalize SATA hardware link reset storms
+    resets = report.gp_log04.sata_hardware_resets
+    cycles = max(1, report.gp_log04.power_on_resets)
+    if resets > max(500, cycles * 3):
+        score -= 10
+
+    # Penalize grown bad blocks / reallocated / pending / uncorrectable sectors
+    grown = report.vendor_nand.grown_bad_blocks
+    for aid in (0x05, 0xC5, 0xC6):
+        if aid in smart_map:
+            grown = max(grown, int(smart_map[aid].raw_value))
+    if grown > 0:
+        score -= min(35, grown * 5)
+
+    score = max(0, min(100, score))
+    if score >= 85:
+        grade = "EXCELLENT"
+    elif score >= 65:
+        grade = "GOOD"
+    elif score >= 40:
+        grade = "FAIR_MONITOR"
+    else:
+        grade = "CRITICAL_REPLACE_SOON"
+
+    poh = report.gp_log04.power_on_hours
+    if poh <= 0 and 0x09 in smart_map:
+        poh = int(smart_map[0x09].raw_value)
+
+    writes_gib = report.gp_log04.host_writes_gib
+    daily_gib = round(writes_gib / (poh / 24.0), 2) if poh >= 24 and writes_gib > 0 else 0.0
+
+    # Effective wear factor relative to nominal 300-P/E TLC endurance (capacity_gb * 300 = 100% endurance)
+    wear_factor = 1.0
+    used_pct = report.gp_log04.percentage_used_endurance if report.gp_log04.supported else (100 - report.true_health_pct)
+    if report.capacity_gb > 0 and writes_gib > 0 and used_pct > 0:
+        expected_used_pct = (writes_gib / (report.capacity_gb * 300.0)) * 100.0
+        if expected_used_pct > 0.01:
+            wear_factor = round(used_pct / expected_used_pct, 2)
+
+    rem_days: Optional[int] = None
+    rem_years: Optional[float] = None
+    if poh >= 24 and 0 < used_pct < 100:
+        hours_per_pct = poh / float(used_pct)
+        rem_hours = hours_per_pct * float(100 - used_pct)
+        rem_days = int(round(rem_hours / 24.0))
+        rem_years = round(rem_days / 365.25, 2)
+
+    return LifespanEstimate(
+        composite_health_score=score,
+        health_grade=grade,
+        daily_host_writes_gib=daily_gib,
+        effective_wear_factor=wear_factor,
+        estimated_remaining_days=rem_days,
+        estimated_remaining_years=rem_years,
+    )
 
 
 def inspect_physical_drive(drive_index: int = 0) -> DriveForensicReport:
@@ -275,7 +362,7 @@ def inspect_physical_drive(drive_index: int = 0) -> DriveForensicReport:
         0,
         None,
     )
-    if handle is None or handle in (-1, 0xFFFFFFFF, 0xFFFFFFFFFFFFFFFF):
+    if not _is_valid_handle(handle):
         return report
 
     try:
@@ -287,8 +374,8 @@ def inspect_physical_drive(drive_index: int = 0) -> DriveForensicReport:
             512,
             False,
         )
-        if id_data:
-            words = struct.unpack("<256H", id_data)
+        if id_data and len(id_data) >= 512:
+            words = struct.unpack("<256H", id_data[:512])
             report.serial_number = _swap_ata_string(id_data[20:40])
             report.firmware_rev = _swap_ata_string(id_data[46:54])
             report.model = _swap_ata_string(id_data[54:94])
@@ -311,7 +398,7 @@ def inspect_physical_drive(drive_index: int = 0) -> DriveForensicReport:
             False,
         )
         smart_map: Dict[int, SmartAttribute] = {}
-        if smart_data:
+        if smart_data and len(smart_data) >= 362:
             for i in range(30):
                 off = 2 + i * 12
                 attr_id = smart_data[off]
@@ -336,6 +423,7 @@ def inspect_physical_drive(drive_index: int = 0) -> DriveForensicReport:
             report.reported_health_pct = smart_map[0xA9].current
         elif 0xE7 in smart_map:
             report.reported_health_pct = smart_map[0xE7].current
+        report.true_health_pct = report.reported_health_pct
 
         # 3. ACS-3 READ LOG EXT (0x2F) -> GP Log 0x04 (Device Statistics)
         def read_gp_log04_page(page: int) -> Optional[bytes]:
@@ -344,9 +432,9 @@ def inspect_physical_drive(drive_index: int = 0) -> DriveForensicReport:
             return _ata_pass_through(handle, prev, curr, 512, True)
 
         p1 = read_gp_log04_page(1)
-        if p1 and (p1[0] == 1 or p1[2] == 1):
+        if p1 and len(p1) >= 512 and (p1[0] == 1 or p1[2] == 1):
             report.gp_log04.supported = True
-            q1 = struct.unpack("<64Q", p1)
+            q1 = struct.unpack("<64Q", p1[:512])
             report.gp_log04.power_on_resets = q1[1] & 0xFFFFFFFFFFFF
             report.gp_log04.power_on_hours = q1[2] & 0xFFFFFFFFFFFF
             report.gp_log04.logical_sectors_written = q1[3] & 0xFFFFFFFFFFFF
@@ -355,28 +443,29 @@ def inspect_physical_drive(drive_index: int = 0) -> DriveForensicReport:
             report.gp_log04.read_commands = q1[6] & 0xFFFFFFFFFFFF
 
         p4 = read_gp_log04_page(4)
-        if p4:
-            q4 = struct.unpack("<64Q", p4)
+        if p4 and len(p4) >= 512 and (report.gp_log04.supported or p4[0] == 4 or p4[2] == 4):
+            q4 = struct.unpack("<64Q", p4[:512])
             report.gp_log04.sata_hardware_resets = (q4[2] or q4[1]) & 0xFFFFFFFFFFFF
             report.gp_log04.sata_asr_events = q4[3] & 0xFFFFFFFFFFFF
             report.gp_log04.sata_crc_errors = q4[4] & 0xFFFFFFFFFFFF
 
         p5 = read_gp_log04_page(5)
-        if p5:
-            q5 = struct.unpack("<64Q", p5)
-            report.gp_log04.current_temp_c = q5[1] & 0xFF
-            report.gp_log04.max_temp_c = q5[2] & 0xFF
-            report.gp_log04.min_temp_c = q5[3] & 0xFF
+        if p5 and len(p5) >= 512 and (report.gp_log04.supported or p5[0] == 5 or p5[2] == 5):
+            q5 = struct.unpack("<64Q", p5[:512])
+            report.gp_log04.current_temp_c = _to_signed_int8(q5[1])
+            report.gp_log04.max_temp_c = _to_signed_int8(q5[2])
+            report.gp_log04.min_temp_c = _to_signed_int8(q5[3])
 
         p7 = read_gp_log04_page(7)
-        if p7:
-            q7 = struct.unpack("<64Q", p7)
-            used = q7[1] & 0xFF
-            report.gp_log04.percentage_used_endurance = used
-            report.true_health_pct = max(0, 100 - used)
+        if p7 and len(p7) >= 512 and (report.gp_log04.supported or p7[0] == 7 or p7[2] == 7):
+            q7 = struct.unpack("<64Q", p7[:512])
+            used = min(255, int(q7[1] & 0xFF))
+            # Only apply Page 0x07 endurance if GP Log 0x04 is supported or valid flag bit (bit 63) / non-zero used is set
+            if report.gp_log04.supported or (q7[1] >> 56) != 0 or used > 0:
+                report.gp_log04.percentage_used_endurance = used
+                report.true_health_pct = max(0, 100 - used)
 
-        # 4. Extract Vendor Controller & NAND Flash ID from IDENTIFY Vendor Words (295..300),
-        #    SMART Log 0xA0, and SMART Attributes 0xA5/0xA6/0xA7
+        # 4. Extract Vendor Controller & NAND Flash ID from IDENTIFY Vendor Words, SMART Log 0xA0, and SMART Attributes
         log_a0 = _ata_pass_through(
             handle,
             b"\x00" * 8,
@@ -414,8 +503,9 @@ def inspect_physical_drive(drive_index: int = 0) -> DriveForensicReport:
                 if 0xA0 in smart_map:
                     report.vendor_nand.grown_bad_blocks = smart_map[0xA0].raw_value
 
-        # 5. Forensic Anomaly & Fake SMART ("Happy Meter") Evaluation
+        # 5. Forensic Anomaly & Lifespan Evaluation
         _evaluate_anomalies(report, smart_map)
+        report.lifespan = compute_lifespan_metrics(report, smart_map)
 
     finally:
         k32.CloseHandle(ctypes.c_void_p(handle))
@@ -436,16 +526,16 @@ def _evaluate_anomalies(report: DriveForensicReport, smart_map: Dict[int, SmartA
                     code="FAKE_SMART_ENDURANCE",
                     title="Spoofed / Firmware-Locked SMART Health ('Happy Meter')",
                     detail=(
-                        f"Legacy SMART reports {report.reported_health_pct}% health (0% wear), "
+                        f"Legacy SMART reports {report.reported_health_pct}% health, "
                         f"but ACS-3 GP Log 0x04 Page 0x07 reveals {used}% endurance consumed "
                         f"(True Remaining Health: {true_health}%)."
                     ),
                 )
             )
 
-    # Check 2: Hardcoded Temperature Sensor
+    # Check 2: Hardcoded Temperature Sensor (mask low byte for controllers packing min/max in upper bytes)
     temp_attr = smart_map.get(0xC2)
-    if temp_attr and temp_attr.raw_value == 40 and report.gp_log04.max_temp_c == 0:
+    if temp_attr and (temp_attr.raw_value & 0xFF) == 40 and report.gp_log04.max_temp_c == 0:
         report.is_fake_smart = True
         report.anomalies.append(
             ForensicAnomaly(
@@ -453,7 +543,7 @@ def _evaluate_anomalies(report: DriveForensicReport, smart_map: Dict[int, SmartA
                 code="HARDCODED_TEMP_40C",
                 title="Hardcoded 40 C Dummy Temperature Sensor",
                 detail=(
-                    "SMART Attribute 0xC2 is hardcoded to 40 C while ACS-3 GP Log 0x04 Page 0x05 "
+                    "SMART Attribute 0xC2 reports a fixed 40 C while ACS-3 GP Log 0x04 Page 0x05 "
                     "reports 0 C historical min/max, confirming the firmware lacks or locks thermal telemetry."
                 ),
             )
@@ -497,12 +587,60 @@ def _evaluate_anomalies(report: DriveForensicReport, smart_map: Dict[int, SmartA
         )
 
 
+def diff_forensic_reports(old_rep: Dict[str, Any], new_rep: Dict[str, Any]) -> Dict[str, Any]:
+    """Compare two forensic report dicts to quantify wear rate, host write reduction, and SATA reset stability."""
+    old_gp = old_rep.get("gp_log04") or {}
+    new_gp = new_rep.get("gp_log04") or {}
+    old_vn = old_rep.get("vendor_nand") or {}
+    new_vn = new_rep.get("vendor_nand") or {}
+
+    old_poh = int(old_gp.get("power_on_hours") or 0)
+    new_poh = int(new_gp.get("power_on_hours") or 0)
+    delta_poh = new_poh - old_poh
+
+    old_sec = int(old_gp.get("logical_sectors_written") or 0)
+    new_sec = int(new_gp.get("logical_sectors_written") or 0)
+    delta_writes_gib = round(((new_sec - old_sec) * 512) / (1024 ** 3), 3)
+    interval_gib_per_day = round(delta_writes_gib / (delta_poh / 24.0), 2) if delta_poh > 0 else None
+
+    old_used = int(old_gp.get("percentage_used_endurance") or 0)
+    new_used = int(new_gp.get("percentage_used_endurance") or 0)
+
+    old_resets = int(old_gp.get("sata_hardware_resets") or 0)
+    new_resets = int(new_gp.get("sata_hardware_resets") or 0)
+
+    old_max_erase = int(old_vn.get("max_erase_count") or 0)
+    new_max_erase = int(new_vn.get("max_erase_count") or 0)
+    old_avg_erase = int(old_vn.get("avg_erase_count") or 0)
+    new_avg_erase = int(new_vn.get("avg_erase_count") or 0)
+    old_grown = int(old_vn.get("grown_bad_blocks") or 0)
+    new_grown = int(new_vn.get("grown_bad_blocks") or 0)
+
+    return {
+        "serial_number": new_rep.get("serial_number") or old_rep.get("serial_number", "Unknown"),
+        "model": new_rep.get("model") or old_rep.get("model", "Unknown"),
+        "delta_power_on_hours": delta_poh,
+        "delta_host_writes_gib": delta_writes_gib,
+        "interval_writes_gib_per_day": interval_gib_per_day,
+        "delta_endurance_used_pct": new_used - old_used,
+        "delta_sata_hardware_resets": new_resets - old_resets,
+        "delta_max_erase_count": new_max_erase - old_max_erase,
+        "delta_avg_erase_count": new_avg_erase - old_avg_erase,
+        "delta_grown_bad_blocks": new_grown - old_grown,
+        "sata_link_stable": (new_resets - old_resets) == 0,
+        "true_health_before": int(old_rep.get("true_health_pct", 100)),
+        "true_health_after": int(new_rep.get("true_health_pct", 100)),
+    }
+
+
 def list_physical_drives() -> List[int]:
-    """Return available PhysicalDrive indices on Windows."""
+    """Return available PhysicalDrive indices on Windows with 64-bit HANDLE safety."""
     if platform.system() != "Windows":
         return [0]
     drives: List[int] = []
     k32 = ctypes.windll.kernel32
+    k32.CreateFileW.restype = ctypes.c_void_p
+    k32.CloseHandle.argtypes = [ctypes.c_void_p]
     for idx in range(8):
         h = k32.CreateFileW(
             f"\\\\.\\PhysicalDrive{idx}",
@@ -513,7 +651,7 @@ def list_physical_drives() -> List[int]:
             0,
             None,
         )
-        if h not in (-1, 0xFFFFFFFFFFFFFFFF):
-            k32.CloseHandle(h)
+        if _is_valid_handle(h):
+            k32.CloseHandle(ctypes.c_void_p(h))
             drives.append(idx)
     return drives or [0]

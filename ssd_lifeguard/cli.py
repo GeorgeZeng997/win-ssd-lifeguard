@@ -8,11 +8,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from . import __version__
-from .forensics import inspect_physical_drive
+from .forensics import diff_forensic_reports, inspect_physical_drive
 from .optimizer import (
     apply_ntfs_lastaccess_fix,
     apply_pagefile_fix,
@@ -26,10 +27,22 @@ from .optimizer import (
 from .write_hunter import run_write_hunt
 
 
-def _print_audit(drive_index: int, as_json: bool) -> int:
+def _save_json_if_requested(payload: Dict[str, Any], export_path: str) -> None:
+    if not export_path:
+        return
+    out_dir = os.path.dirname(os.path.abspath(export_path))
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+    with open(export_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+
+
+def _print_audit(drive_index: int, as_json: bool, export_path: str = "") -> int:
     rep = inspect_physical_drive(drive_index)
+    payload = rep.to_dict()
+    _save_json_if_requested(payload, export_path)
     if as_json:
-        print(json.dumps(rep.to_dict(), indent=2))
+        print(json.dumps(payload, indent=2))
         return 0
 
     print("=" * 76)
@@ -43,6 +56,19 @@ def _print_audit(drive_index: int, as_json: bool) -> int:
     print("-" * 76)
     print(f"  Reported SMART Health : {rep.reported_health_pct}%")
     print(f"  True ACS-3 Health     : {rep.true_health_pct}% (Used Endurance: {rep.gp_log04.percentage_used_endurance}%)")
+    print(
+        f"  Composite Reliability : {rep.lifespan.composite_health_score}/100 [{rep.lifespan.health_grade}] "
+        f"(Wear Factor: {rep.lifespan.effective_wear_factor:.2f}x)"
+    )
+    if rep.lifespan.daily_host_writes_gib > 0:
+        rul_str = (
+            f"~{rep.lifespan.estimated_remaining_years} yrs ({rep.lifespan.estimated_remaining_days:,} days)"
+            if rep.lifespan.estimated_remaining_days is not None
+            else "N/A"
+        )
+        print(
+            f"  Historical Write Rate : {rep.lifespan.daily_host_writes_gib:.2f} GiB/day | Est. Remaining Life: {rul_str}"
+        )
     print(f"  Fake SMART Detected   : {'YES (SPOOFED / LOCKED)' if rep.is_fake_smart else 'No'}")
 
     if rep.gp_log04.supported:
@@ -50,9 +76,13 @@ def _print_audit(drive_index: int, as_json: bool) -> int:
         print("-" * 76)
         print("  [ACS-3 GP Log 0x04 -- True Hardware Telemetry]")
         print(f"    Power-On Hours       : {g.power_on_hours:,} hrs ({g.power_on_resets:,} power cycles)")
-        print(f"    Total Host Writes    : {g.host_writes_gib:,.2f} GiB ({g.write_commands:,} write cmds, avg {g.avg_write_size_kb} KB)")
+        print(
+            f"    Total Host Writes    : {g.host_writes_gib:,.2f} GiB ({g.write_commands:,} write cmds, avg {g.avg_write_size_kb} KB)"
+        )
         print(f"    Total Host Reads     : {g.host_reads_gib:,.2f} GiB ({g.read_commands:,} read cmds)")
-        print(f"    SATA Hardware Resets : {g.sata_hardware_resets:,} resets (ASR: {g.sata_asr_events:,}, CRC: {g.sata_crc_errors:,})")
+        print(
+            f"    SATA Hardware Resets : {g.sata_hardware_resets:,} resets (ASR: {g.sata_asr_events:,}, CRC: {g.sata_crc_errors:,})"
+        )
 
     if rep.vendor_nand.detected:
         v = rep.vendor_nand
@@ -60,7 +90,9 @@ def _print_audit(drive_index: int, as_json: bool) -> int:
         print("  [Vendor Log 0xE0 -- Hidden FTL & NAND Erase Telemetry]")
         print(f"    Controller Architecture : {v.controller_hint}")
         print(f"    Raw NAND Flash ID       : {v.flash_id_hex} ({v.flash_description})")
-        print(f"    Block Erase Counts      : Max = {v.max_erase_count} | Min = {v.min_erase_count} | Avg = {v.avg_erase_count}")
+        print(
+            f"    Block Erase Counts      : Max = {v.max_erase_count} | Min = {v.min_erase_count} | Avg = {v.avg_erase_count}"
+        )
         print(f"    Static Wear Skew Ratio  : {v.erase_skew_ratio}x (Max / Avg)")
         print(f"    Bad Block Count         : Factory = {v.factory_bad_blocks} | Grown = {v.grown_bad_blocks}")
 
@@ -72,13 +104,58 @@ def _print_audit(drive_index: int, as_json: bool) -> int:
             print(f"      -> {a.detail}")
 
     print("=" * 76)
+    if export_path:
+        print(f"  Saved JSON forensic snapshot to: {export_path}")
     return 0
 
 
-def _print_hunt(duration: int, minutes: int, as_json: bool) -> int:
-    res = run_write_hunt(duration_sec=duration, recent_minutes=minutes)
+def _print_diff(baseline_path: str, target_path: str, drive_index: int, as_json: bool) -> int:
+    with open(baseline_path, "r", encoding="utf-8") as f:
+        old_rep = json.load(f)
+    if target_path:
+        with open(target_path, "r", encoding="utf-8") as f:
+            new_rep = json.load(f)
+        target_label = target_path
+    else:
+        new_rep = inspect_physical_drive(drive_index).to_dict()
+        target_label = f"LIVE PhysicalDrive{drive_index}"
+
+    delta = diff_forensic_reports(old_rep, new_rep)
     if as_json:
-        print(json.dumps(res.to_dict(), indent=2))
+        print(json.dumps(delta, indent=2))
+        return 0
+
+    print("=" * 76)
+    print(f"  SSD TELEMETRY SNAPSHOT DIFF: {baseline_path} -> {target_label}")
+    print("=" * 76)
+    print(f"  Drive                : {delta['model']} ({delta['serial_number']})")
+    print(f"  Elapsed Power-On Hrs : {delta['delta_power_on_hours']:+,} hrs")
+    rate_str = (
+        f" ({delta['interval_writes_gib_per_day']:.2f} GiB/day)"
+        if delta["interval_writes_gib_per_day"] is not None
+        else ""
+    )
+    print(f"  Host Writes Delta    : {delta['delta_host_writes_gib']:+.3f} GiB{rate_str}")
+    print(
+        f"  True Health          : {delta['true_health_before']}% -> {delta['true_health_after']}% "
+        f"(Endurance Used Delta: {delta['delta_endurance_used_pct']:+d}%)"
+    )
+    print(
+        f"  NAND Block Erases    : Max {delta['delta_max_erase_count']:+d} | Avg {delta['delta_avg_erase_count']:+d} | "
+        f"Grown Bad Blocks {delta['delta_grown_bad_blocks']:+d}"
+    )
+    link_badge = "STABLE (0 new link drops)" if delta["sata_link_stable"] else "LINK RESETS DETECTED"
+    print(f"  SATA Hardware Resets : {delta['delta_sata_hardware_resets']:+,} [{link_badge}]")
+    print("=" * 76)
+    return 0
+
+
+def _print_hunt(duration: int, minutes: int, as_json: bool, export_path: str = "") -> int:
+    res = run_write_hunt(duration_sec=duration, recent_minutes=minutes)
+    payload = res.to_dict()
+    _save_json_if_requested(payload, export_path)
+    if as_json:
+        print(json.dumps(payload, indent=2))
         return 0
 
     print("=" * 76)
@@ -98,13 +175,17 @@ def _print_hunt(duration: int, minutes: int, as_json: bool) -> int:
         for f in res.recent_files[:15]:
             print(f"    [{f.category}] {f.size_kb:>8.1f} KB | {f.last_write_time} | {f.path}")
     print("=" * 76)
+    if export_path:
+        print(f"  Saved write-hunt JSON report to: {export_path}")
     return 0
 
 
-def _print_status(as_json: bool) -> int:
+def _print_status(as_json: bool, export_path: str = "") -> int:
     st = check_protection_status()
+    payload = st.to_dict()
+    _save_json_if_requested(payload, export_path)
     if as_json:
-        print(json.dumps(st.to_dict(), indent=2))
+        print(json.dumps(payload, indent=2))
         return 0
 
     print("=" * 76)
@@ -112,9 +193,14 @@ def _print_status(as_json: bool) -> int:
     print("=" * 76)
     print(f"  [Layer 1] SATA LPM (HIPM/DIPM Disabled) : {'ACTIVE' if st.sata_lpm_disabled else 'NOT CONFIGURED'}")
     print(f"  [Layer 2] NTFS LastAccess Disabled      : {'ACTIVE' if st.ntfs_lastaccess_disabled else 'NOT CONFIGURED'}")
-    print(f"  [Layer 3] Pagefile Right-Sized          : {st.pagefile_allocated_mb} MB ({'OPTIMIZED' if st.pagefile_optimized else 'BLOATED'})")
-    print(f"  [Layer 5] Dynamic RAMDisk ({st.ramdisk_drive})          : {'MOUNTED' if st.ramdisk_mounted else 'NOT MOUNTED'} "
-          f"({st.ramdisk_free_gb}/{st.ramdisk_total_gb} GB free, RAM used: {st.ramdisk_working_set_mb} MB)")
+    print(
+        f"  [Layer 3] Pagefile Right-Sized          : {st.pagefile_allocated_mb} MB "
+        f"({'OPTIMIZED' if st.pagefile_optimized else 'BLOATED'})"
+    )
+    print(
+        f"  [Layer 5] Dynamic RAMDisk ({st.ramdisk_drive})          : {'MOUNTED' if st.ramdisk_mounted else 'NOT MOUNTED'} "
+        f"({st.ramdisk_free_gb}/{st.ramdisk_total_gb} GB free, RAM used: {st.ramdisk_working_set_mb} MB)"
+    )
     print(f"  [Layer 5] TEMP/TMP Redirected to R:     : {'YES' if st.temp_redirected else 'NO'}")
     print(f"  [Layer 7] Hardware Over-Provisioning OP : {st.unallocated_op_gb:.2f} GB Unallocated")
     print("-" * 76)
@@ -122,6 +208,8 @@ def _print_status(as_json: bool) -> int:
     for j in st.junctions:
         print(f"    - {j.name:<32} : {j.status}")
     print("=" * 76)
+    if export_path:
+        print(f"  Saved protection status JSON to: {export_path}")
     return 0
 
 
@@ -139,14 +227,26 @@ def build_parser() -> argparse.ArgumentParser:
     p_audit = sub.add_parser("audit", help="Run deep ATA/ACS-3/Vendor forensic inspection & Fake SMART check")
     p_audit.add_argument("--drive", type=int, default=0, help="PhysicalDrive index (default: 0)")
     p_audit.add_argument("--json", action="store_true", help="Output report as JSON")
+    p_audit.add_argument("--export", type=str, default="", help="Save forensic report JSON to file")
+
+    p_diff = sub.add_parser(
+        "diff",
+        help="Compare a saved audit JSON snapshot against live drive telemetry (or a second audit JSON)",
+    )
+    p_diff.add_argument("baseline", help="Path to baseline audit JSON snapshot")
+    p_diff.add_argument("target", nargs="?", default="", help="Optional path to newer audit JSON (defaults to live drive)")
+    p_diff.add_argument("--drive", type=int, default=0, help="Live PhysicalDrive index when target is omitted (default: 0)")
+    p_diff.add_argument("--json", action="store_true", help="Output diff summary as JSON")
 
     p_hunt = sub.add_parser("hunt", help="Sample real-time physical SSD writes vs process writes & recent files")
     p_hunt.add_argument("--duration", type=int, default=5, help="Sample window in seconds (default: 5)")
     p_hunt.add_argument("--minutes", type=int, default=2, help="Lookback window in minutes for modified files (default: 2)")
     p_hunt.add_argument("--json", action="store_true", help="Output result as JSON")
+    p_hunt.add_argument("--export", type=str, default="", help="Save write-hunt JSON report to file")
 
     p_status = sub.add_parser("status", help="Check current status of all 7 SSD protection layers")
     p_status.add_argument("--json", action="store_true", help="Output status as JSON")
+    p_status.add_argument("--export", type=str, default="", help="Save protection status JSON to file")
 
     p_opt = sub.add_parser("optimize", help="Apply OS & power SSD lifespan protections (Layers 1-4)")
     p_opt.add_argument("--all", action="store_true", help="Apply SATA LPM, NTFS LastAccess, Pagefile, and ReTrim fixes")
@@ -174,15 +274,18 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if not args.command or args.command == "gui":
         from .gui import launch_gui
+
         launch_gui()
         return 0
 
     if args.command == "audit":
-        return _print_audit(args.drive, args.json)
+        return _print_audit(args.drive, args.json, args.export)
+    if args.command == "diff":
+        return _print_diff(args.baseline, args.target, args.drive, args.json)
     if args.command == "hunt":
-        return _print_hunt(args.duration, args.minutes, args.json)
+        return _print_hunt(args.duration, args.minutes, args.json, args.export)
     if args.command == "status":
-        return _print_status(args.json)
+        return _print_status(args.json, args.export)
     if args.command == "optimize":
         if args.all or args.sata_lpm:
             ok, msg = apply_sata_lpm_fix()
@@ -201,8 +304,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.command == "ramdisk":
         ok, msg = deploy_dynamic_ramdisk(size_gb=args.size_gb, drive_letter=args.drive)
         print(f"[{'OK' if ok else 'ERR'}] {msg}")
-        if args.junctions:
-            ok2, msg2, _ = deploy_cache_junctions(f"{args.drive.rstrip(':')}:\\Temp")
+        if args.junctions and ok:
+            ok2, msg2, _ = deploy_cache_junctions(f"{args.drive.rstrip(':').upper()}:\\Temp")
             print(f"[{'OK' if ok2 else 'ERR'}] {msg2}")
         return 0
     if args.command == "op":
