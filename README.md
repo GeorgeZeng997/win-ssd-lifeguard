@@ -84,23 +84,26 @@ pip install -e .
 # Launch Desktop GUI
 win-ssd-lifeguard gui
 
-# 1. Deep ATA/ACS-3 Forensic Audit & Fake SMART Check
-win-ssd-lifeguard audit --drive 0
+# 1. Deep ATA/ACS-3 Forensic Audit, Composite Health Score & JSON Export
+win-ssd-lifeguard audit --drive 0 --export baseline_ssd.json
 win-ssd-lifeguard audit --drive 0 --json
 
-# 2. Hunt Real-Time High-Frequency Disk Writes (5s sample)
-win-ssd-lifeguard hunt --duration 5 --minutes 2
+# 2. Compare Saved Baseline Snapshot vs. Live SSD Telemetry (Quantify Write Reduction & Link Stability)
+win-ssd-lifeguard diff baseline_ssd.json --drive 0
 
-# 3. Check Status of All 7 SSD Lifespan Protection Layers
+# 3. Hunt Real-Time High-Frequency Disk Writes (5s sample)
+win-ssd-lifeguard hunt --duration 5 --minutes 2 --export write_hunt.json
+
+# 4. Check Status of All 7 SSD Lifespan Protection Layers
 win-ssd-lifeguard status
 
-# 4. Apply OS & Power Fixes (SATA LPM + NTFS LastAccess + 4GB Pagefile + ReTrim)
+# 5. Apply OS & Power Fixes (SATA LPM + NTFS LastAccess + 4GB Pagefile + ReTrim)
 win-ssd-lifeguard optimize --all
 
-# 5. Deploy 16 GB Dynamic RAMDisk (R:) & Offload 19 Cache/Telemetry Directories
+# 6. Deploy 16 GB Dynamic RAMDisk (R:) & Offload 19 Cache/Telemetry Directories
 win-ssd-lifeguard ramdisk --size-gb 16 --drive R --junctions
 
-# 6. Reserve 100 GB Unallocated Hardware Over-Provisioning (OP) Space from E:
+# 7. Reserve 100 GB Unallocated Hardware Over-Provisioning (OP) Space from E:
 win-ssd-lifeguard op --drive E --size-gb 100
 ```
 

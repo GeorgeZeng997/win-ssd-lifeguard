@@ -386,7 +386,10 @@ class SSDLifeguardApp:
             fg=ACCENT_RED if rep.is_fake_smart else ACCENT_GREEN,
         )
         self.lbl_health_sub.config(
-            text=f"Used Endurance: {used}% ({'SPOOFED SMART' if rep.is_fake_smart else 'Verified'})"
+            text=(
+                f"Composite: {rep.lifespan.composite_health_score}/100 ({rep.lifespan.health_grade}) | "
+                f"{'SPOOFED SMART' if rep.is_fake_smart else 'Verified'}"
+            )
         )
 
         if rep.vendor_nand.detected:
@@ -568,7 +571,24 @@ class SSDLifeguardApp:
         )
 
 
+def _enable_high_dpi() -> None:
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+    except Exception:
+        try:
+            import ctypes
+
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
+
+
 def launch_gui() -> None:
+    _enable_high_dpi()
     root = tk.Tk()
     SSDLifeguardApp(root)
     root.mainloop()

@@ -19,10 +19,19 @@ import ctypes
 import json
 import os
 import platform
+import re
 import shutil
 import subprocess
-from dataclasses import dataclass, field, asdict
-from typing import Dict, List, Optional, Tuple
+from dataclasses import asdict, dataclass, field
+from typing import List, Optional, Tuple
+
+
+def normalize_drive_letter(drive: str) -> str:
+    """Validate and normalize a Windows drive letter ('R' or 'R:') to a single uppercase ASCII letter."""
+    dl = drive.strip().rstrip(":").upper()
+    if not re.fullmatch(r"[A-Z]", dl):
+        raise ValueError(f"Invalid Windows drive letter: {drive!r}")
+    return dl
 
 
 @dataclass
@@ -56,19 +65,24 @@ class SystemProtectionStatus:
 def _run_ps(script: str, timeout: int = 60) -> Tuple[int, str, str]:
     if platform.system() != "Windows":
         return 1, "", "Windows required"
-    proc = subprocess.run(
-        ["powershell", "-NoProfile", "-Command", script],
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-        creationflags=0x08000000,
-    )
-    return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
+    try:
+        proc = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", script],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            creationflags=0x08000000,
+        )
+        return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
+    except subprocess.TimeoutExpired:
+        return 1, "", f"PowerShell command timed out after {timeout}s"
+    except OSError as exc:
+        return 1, "", str(exc)
 
 
 def get_default_junction_specs(ramdisk_temp: str = r"R:\Temp") -> List[JunctionTargetSpec]:
-    local_app = os.environ.get("LOCALAPPDATA", r"C:\Users\Administrator\AppData\Local")
-    roaming_app = os.environ.get("APPDATA", r"C:\Users\Administrator\AppData\Roaming")
+    local_app = os.environ.get("LOCALAPPDATA") or os.path.expanduser(r"~\AppData\Local")
+    roaming_app = os.environ.get("APPDATA") or os.path.expanduser(r"~\AppData\Roaming")
     specs = [
         JunctionTargetSpec("System Temp", "Windows System Temp", r"C:\Windows\Temp", rf"{ramdisk_temp}\WinTemp"),
         JunctionTargetSpec("Browser Cache", "Chrome HTTP Cache", rf"{local_app}\Google\Chrome\User Data\Default\Cache", rf"{ramdisk_temp}\ChromeCache\Cache"),
@@ -92,14 +106,17 @@ def get_default_junction_specs(ramdisk_temp: str = r"R:\Temp") -> List[JunctionT
     ]
     for s in specs:
         if os.path.exists(s.link_path):
-            try:
-                attrs = ctypes.windll.kernel32.GetFileAttributesW(s.link_path)
-                if attrs != -1 and (attrs & 0x400):
-                    s.status = "Active (NTFS Junction -> RAMDisk)"
-                else:
-                    s.status = "Physical Directory on SSD"
-            except Exception:
-                s.status = "Unknown"
+            if platform.system() == "Windows":
+                try:
+                    attrs = ctypes.windll.kernel32.GetFileAttributesW(s.link_path)
+                    if attrs != -1 and (attrs & 0x400):
+                        s.status = "Active (NTFS Junction -> RAMDisk)"
+                    else:
+                        s.status = "Physical Directory on SSD"
+                except Exception:
+                    s.status = "Unknown"
+            else:
+                s.status = "Physical Directory on SSD"
         else:
             s.status = "Not Present"
     return specs
@@ -187,6 +204,9 @@ fsutil behavior set DisableDeleteNotification 0
 
 def apply_pagefile_fix(size_mb: int = 4096) -> Tuple[bool, str]:
     """Layer 3: Set C:\\pagefile.sys to a fixed size (default 4096 MB)."""
+    size_mb = int(size_mb)
+    if size_mb < 256 or size_mb > 131072:
+        return False, f"Invalid pagefile size: {size_mb} MB (expected 256..131072 MB)."
     ps = f"""
 $cs = Get-CimInstance Win32_ComputerSystem
 if ($cs.AutomaticManagedPagefile) {{
@@ -209,7 +229,12 @@ def run_volume_retrim(drives: Optional[List[str]] = None) -> Tuple[bool, str]:
     """Layer 4: Execute ATA ReTrim across specified NTFS volumes."""
     if not drives:
         drives = ["C", "D", "E"]
-    letters = ",".join(f"'{d.rstrip(':')}'" for d in drives)
+    try:
+        clean_drives = [normalize_drive_letter(d) for d in drives]
+    except ValueError as exc:
+        return False, str(exc)
+
+    letters = ",".join(f"'{d}'" for d in clean_drives)
     ps = f"""
 $vols = Get-Volume | Where-Object {{ $_.DriveLetter -in @({letters}) -and $_.FileSystem -eq 'NTFS' }}
 foreach ($v in $vols) {{
@@ -218,7 +243,7 @@ foreach ($v in $vols) {{
 """
     rc, out, err = _run_ps(ps, timeout=180)
     if rc == 0:
-        return True, f"Completed ATA ReTrim across volumes {', '.join(drives)}."
+        return True, f"Completed ATA ReTrim across volumes {', '.join(clean_drives)}."
     return False, err or out
 
 
@@ -227,7 +252,15 @@ def deploy_dynamic_ramdisk(size_gb: int = 16, drive_letter: str = "R") -> Tuple[
     Layer 5: Configure and mount a Dynamic RAMDisk via ImDisk Toolkit (`RamDyn.exe` + `ImDiskRD` service)
     and redirect User/System TEMP & TMP environment variables to `<drive_letter>:\\Temp`.
     """
-    dl = drive_letter.rstrip(":").upper()
+    try:
+        dl = normalize_drive_letter(drive_letter)
+    except ValueError as exc:
+        return False, str(exc)
+
+    size_gb = int(size_gb)
+    if size_gb < 1 or size_gb > 512:
+        return False, f"Invalid RAMDisk size: {size_gb} GB (expected 1..512 GB)."
+
     if not os.path.exists(r"C:\Program Files\ImDisk\RamDyn.exe"):
         return False, "ImDisk Toolkit is not installed at C:\\Program Files\\ImDisk. Please install ImDisk Toolkit first."
 
@@ -281,7 +314,7 @@ def deploy_cache_junctions(ramdisk_temp: str = r"R:\Temp") -> Tuple[bool, str, L
     if platform.system() != "Windows":
         return False, "Windows required", specs
 
-    mkdir_lines = ['@echo off']
+    mkdir_lines = ["@echo off"]
     for s in specs:
         os.makedirs(s.ramdisk_subpath, exist_ok=True)
         mkdir_lines.append(f'mkdir "{s.ramdisk_subpath}" 2>nul')
@@ -306,11 +339,16 @@ def deploy_cache_junctions(ramdisk_temp: str = r"R:\Temp") -> Tuple[bool, str, L
                 if os.path.exists(bak):
                     shutil.rmtree(bak, ignore_errors=True)
                 os.rename(link, bak)
-                subprocess.run(["cmd", "/c", "mklink", "/J", link, target], capture_output=True, creationflags=0x08000000)
+                subprocess.run(
+                    ["cmd", "/c", "mklink", "/J", link, target],
+                    capture_output=True,
+                    timeout=15,
+                    creationflags=0x08000000,
+                )
                 shutil.rmtree(bak, ignore_errors=True)
                 s.status = "Migrated -> NTFS Junction"
                 migrated_count += 1
-            except OSError:
+            except (OSError, subprocess.TimeoutExpired):
                 s.status = "In-Use (Scheduled for Boot Junction)"
                 in_use_count += 1
                 mkdir_lines.append(f'fsutil reparsepoint query "{link}" >nul 2>&1')
@@ -319,7 +357,12 @@ def deploy_cache_junctions(ramdisk_temp: str = r"R:\Temp") -> Tuple[bool, str, L
                 mkdir_lines.append(f'    mklink /J "{link}" "{target}" >nul 2>&1')
                 mkdir_lines.append(")")
         else:
-            subprocess.run(["cmd", "/c", "mklink", "/J", link, target], capture_output=True, creationflags=0x08000000)
+            subprocess.run(
+                ["cmd", "/c", "mklink", "/J", link, target],
+                capture_output=True,
+                timeout=15,
+                creationflags=0x08000000,
+            )
             s.status = "Created -> NTFS Junction"
             migrated_count += 1
 
@@ -332,7 +375,10 @@ def deploy_cache_junctions(ramdisk_temp: str = r"R:\Temp") -> Tuple[bool, str, L
             f"Set-ItemProperty -Path 'HKLM:\\SOFTWARE\\ImDisk' -Name 'R_RunObject' -Value '{init_cmd_path}' -Type String"
         )
 
-    msg = f"Offloaded {migrated_count}/{len(specs)} high-frequency cache/telemetry directories to {ramdisk_temp} ({in_use_count} queued for boot)."
+    msg = (
+        f"Offloaded {migrated_count}/{len(specs)} high-frequency cache/telemetry directories to {ramdisk_temp} "
+        f"({in_use_count} queued for boot)."
+    )
     return True, msg, specs
 
 
@@ -341,7 +387,15 @@ def configure_over_provisioning(shrink_drive: str = "E", op_size_gb: int = 100) 
     Layer 7: Perform ATA ReTrim on `shrink_drive` first, then non-destructively shrink
     the partition by `op_size_gb` GB to create a clean hardware Over-Provisioning (OP) pool.
     """
-    dl = shrink_drive.rstrip(":").upper()
+    try:
+        dl = normalize_drive_letter(shrink_drive)
+    except ValueError as exc:
+        return False, str(exc)
+
+    op_size_gb = int(op_size_gb)
+    if op_size_gb < 1 or op_size_gb > 4096:
+        return False, f"Invalid Over-Provisioning size: {op_size_gb} GB (expected 1..4096 GB)."
+
     ps = f"""
 $ErrorActionPreference = 'Stop'
 Optimize-Volume -DriveLetter {dl} -ReTrim
